@@ -1,0 +1,12 @@
+# Recovered personal data and backups must never be committed.
+TVTime-Recovery-*/
+*.db
+*.sqlite
+*.sqlite3
+Manifest.plist
+Info.plist
+Status.plist
+
+__pycache__/
+*.pyc
+.DS_Store
