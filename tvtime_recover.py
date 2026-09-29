@@ -9,7 +9,9 @@ CSV files, a JSON library and a Simkl import file.
 
 Standard library only (Python 3.9+). AES comes from macOS CommonCrypto, from
 the OpenSSL library that ships with Python, or from a pure-Python fallback.
-The backup is only read, never modified. Nothing is sent anywhere.
+The backup is only read, never modified. The only network request goes to the
+public TVmaze API (TVDB show IDs only) to fill in episode numbers for the Simkl
+file; --offline turns it off.
 
     python3 tvtime_recover.py                     # find the backup automatically
     python3 tvtime_recover.py --backup PATH       # a specific backup folder
@@ -34,12 +36,15 @@ import sqlite3
 import struct
 import sys
 import tempfile
+import time
+import urllib.error
+import urllib.request
 import webbrowser
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 BUNDLE_ID = "com.tozelabs.tvshowtime"
 DOMAIN_PATTERN = "%tozelabs%"
@@ -52,6 +57,7 @@ SIMKL_STATUS = {
     "stopped": "dropped",
     "not_started_yet": "plan to watch",
 }
+TVMAZE_API = "https://api.tvmaze.com"
 
 
 class RecoveryError(Exception):
@@ -1068,8 +1074,9 @@ def build_library(payloads: list[dict]) -> dict:
 # --------------------------------------------------------------------------
 # Outputs
 # --------------------------------------------------------------------------
-def _csv(path: Path, header: list[str], rows) -> None:
-    with path.open("w", newline="", encoding="utf-8-sig") as fh:
+def _csv(path: Path, header: list[str], rows, *, bom: bool = True) -> None:
+    # The BOM helps Excel read UTF-8; the Simkl file is written without it.
+    with path.open("w", newline="", encoding="utf-8-sig" if bom else "utf-8") as fh:
         writer = csv.writer(fh)
         writer.writerow(header)
         writer.writerows(rows)
@@ -1082,7 +1089,78 @@ def _simkl_date(iso: str) -> str:
     return moment.strftime("%H:%M:%S %d-%m-%Y")
 
 
-def simkl_rows(lib: dict) -> list[list]:
+def _code_key(code: str):
+    match = re.fullmatch(r"S(\d+)E(\d+)", code or "")
+    return (int(match[1]), int(match[2])) if match else None
+
+
+def _fetch_json(url: str):
+    """GET a JSON document; None on 404. Waits and retries when rate-limited."""
+    request = urllib.request.Request(url, headers={"User-Agent": f"tvtime-ios-recovery/{__version__}"})
+    for attempt in range(5):
+        try:
+            with urllib.request.urlopen(request, timeout=20) as resp:
+                return json.load(resp)
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                return None
+            if exc.code != 429 or attempt == 4:
+                raise
+            time.sleep(2 * (attempt + 1))
+    return None
+
+
+def _moment(iso: str) -> datetime:
+    return datetime.fromisoformat(iso.replace("Z", "+00:00"))
+
+
+def tvmaze_positions(lib: dict, fetch=None, log=print) -> dict[int, str]:
+    """Last watched episode, looked up on TVmaze, for series whose position the cache doesn't give.
+
+    Simkl marks episodes of a "completed" series only when the series has ended, so an ongoing one lands
+    in "watching" at 0%. For those we send the last episode aired before the last watch date. For a
+    series in progress whose next episode opens a new season, it's the last episode of the season before.
+    """
+    wanted = {}
+    for s in lib["series"]:
+        nxt = s["next_episode"]
+        if not s["tvdb_id"]:
+            continue
+        if s["status"] == "up_to_date":
+            wanted[s["tvdb_id"]] = ("aired_by", s["last_watched_at"] or lib["snapshot_at"])
+        elif not s["last_seen_episode"] and nxt and nxt["number"] == 1 and nxt["season"] > 1:
+            wanted[s["tvdb_id"]] = ("season_end", nxt["season"] - 1)
+    if not wanted:
+        return {}
+    fetch = fetch or _fetch_json
+    log(f"Looking up episode numbers for {len(wanted)} series on TVmaze (--offline to skip)...")
+    found, errors = {}, 0
+    for tvdb_id, (kind, arg) in wanted.items():
+        try:
+            show = fetch(f"{TVMAZE_API}/lookup/shows?thetvdb={tvdb_id}")
+            episodes = (fetch(f"{TVMAZE_API}/shows/{show['id']}/episodes") or []) if show else []
+        except (OSError, ValueError, KeyError, TypeError):
+            errors += 1
+            if errors >= 3 and not found:
+                log("  TVmaze is not reachable; the Simkl file is written without these episode numbers.")
+                return {}
+            continue
+        regular = [e for e in episodes if isinstance(e, dict) and _int(e.get("season")) and _int(e.get("number"))]
+        if kind == "aired_by":
+            cutoff = _moment(arg) if arg else None
+            regular = [e for e in regular if e.get("airstamp") and (cutoff is None or _moment(e["airstamp"]) <= cutoff)]
+        else:
+            regular = [e for e in regular if _int(e["season"]) == arg]
+        if regular:
+            last = max(regular, key=lambda e: (_int(e["season"]), _int(e["number"])))
+            found[tvdb_id] = episode_code(last["season"], last["number"])
+    missing = len(wanted) - len(found)
+    log(f"  found {len(found)} of {len(wanted)}" + (f"; {missing} not on TVmaze or failed" if missing else ""))
+    return found
+
+
+def simkl_rows(lib: dict, positions: dict | None = None) -> list[list]:
+    positions = positions or {}
     rows = []
     for m in lib["movies"]:
         status = "completed" if m["watched"] else "plan to watch" if m["watch_later"] else ""
@@ -1091,12 +1169,19 @@ def simkl_rows(lib: dict) -> list[list]:
                          _simkl_date(m["watched_at"]) if m["watched"] else ""])
     for s in lib["series"]:
         status = SIMKL_STATUS.get(s["status"]) or ("watching" if s["last_seen_episode"] else "plan to watch")
-        last = s["last_seen_episode"] if status in ("watching", "dropped", "on hold") else ""
-        rows.append(["tv", s["title"], "", s["tvdb_id"], "", status, last or "", _simkl_date(s["last_watched_at"])])
+        known, looked_up = s["last_seen_episode"] or "", positions.get(s["tvdb_id"], "")
+        if status == "completed":
+            # Without a number Simkl marks everything aired, which is right for ended series only.
+            last = max((c for c in (known, looked_up) if _code_key(c)), key=_code_key) if looked_up else ""
+        elif status in ("watching", "dropped", "on hold"):
+            last = known or looked_up
+        else:
+            last = ""
+        rows.append(["tv", s["title"], "", s["tvdb_id"], "", status, last, _simkl_date(s["last_watched_at"])])
     return rows
 
 
-def write_outputs(lib: dict, out: Path) -> None:
+def write_outputs(lib: dict, out: Path, positions: dict | None = None) -> None:
     out.mkdir(parents=True, exist_ok=True)
     (out / "library.json").write_text(json.dumps(lib, ensure_ascii=False, indent=1), encoding="utf-8")
     _csv(out / "series.csv",
@@ -1118,7 +1203,7 @@ def write_outputs(lib: dict, out: Path) -> None:
            int(m["favorite"]), m["runtime_min"] or "", ", ".join(m["genres"]), m["imdb_id"]] for m in lib["movies"]])
     _csv(out / "simkl_import.csv",
          ["Type", "Title", "Year", "TVDB_ID", "IMDB_ID", "Watchlist", "LastEpWatched", "WatchedDate"],
-         simkl_rows(lib))
+         simkl_rows(lib, positions), bom=False)
     data = json.dumps(lib, ensure_ascii=False).replace("<", "\\u003c")
     (out / "TVTime.html").write_text(VIEWER_HTML.replace("__DATA__", data), encoding="utf-8")
 
@@ -1203,6 +1288,8 @@ def main(argv=None) -> int:
     parser.add_argument("--diagnose", action="store_true", help="print the cache structure without personal data "
                         "(for bug reports) and write nothing")
     parser.add_argument("--no-open", action="store_true", help="do not open the result page in the browser")
+    parser.add_argument("--offline", action="store_true", help="don't look up episode numbers for the Simkl file "
+                        "on TVmaze (the only network request)")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     args = parser.parse_args(argv)
     log = print
@@ -1255,7 +1342,8 @@ def main(argv=None) -> int:
                 output.mkdir(parents=True, exist_ok=True)
                 _csv(output / "file_index.csv", ["domain", "path", "status", "bytes"],
                      [[e["domain"], e["path"], e["status"], e["bytes"]] for e in index])
-            write_outputs(lib, output)
+            positions = {} if args.offline else tvmaze_positions(lib, log=log)
+            write_outputs(lib, output, positions)
 
         st = lib["stats"]
         log("")

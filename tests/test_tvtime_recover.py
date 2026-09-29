@@ -241,7 +241,9 @@ def make_backup(folder: Path, files: dict, password: bytes | None, *, stale_size
 
 def run_cli(args, stdin=""):
     out, err = io.StringIO(), io.StringIO()
-    with mock.patch("sys.stdin", io.StringIO(stdin)), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+    offline = mock.patch.object(tv, "_fetch_json", side_effect=OSError("no network in tests"))
+    with mock.patch("sys.stdin", io.StringIO(stdin)), offline, contextlib.redirect_stdout(out), \
+            contextlib.redirect_stderr(err):
         code = tv.main(args)
     return code, out.getvalue(), err.getvalue()
 
@@ -400,9 +402,11 @@ class OutputTests(unittest.TestCase):
         lib = tv.build_library(payloads_from(modern_cache_rows()))
         with tempfile.TemporaryDirectory() as tmp:
             tv.write_outputs(lib, Path(tmp))
-            with open(Path(tmp) / "simkl_import.csv", encoding="utf-8-sig", newline="") as fh:
-                rows = list(csv.DictReader(fh))
+            raw = (Path(tmp) / "simkl_import.csv").read_bytes()
+            rows = list(csv.DictReader(io.StringIO(raw.decode("utf-8"), newline="")))
+            self.assertTrue((Path(tmp) / "series.csv").read_bytes().startswith(b"\xef\xbb\xbf"))
             html = (Path(tmp) / "TVTime.html").read_text(encoding="utf-8")
+        self.assertTrue(raw.startswith(b"Type,"), "Simkl file must not start with a BOM")
         self.assertEqual(list(rows[0]), ["Type", "Title", "Year", "TVDB_ID", "IMDB_ID", "Watchlist",
                                          "LastEpWatched", "WatchedDate"])
         by_title = {r["Title"]: r for r in rows}
@@ -420,6 +424,83 @@ class OutputTests(unittest.TestCase):
                             for r in rows))
         self.assertNotIn("Delta <Show>", html, "raw '<' must be escaped inside the page")
         self.assertIn("Delta \\u003cShow>", html)
+
+
+def tvmaze_episode(season, number, airstamp):
+    return {"season": season, "number": number, "airstamp": airstamp}
+
+
+class TvmazeTests(unittest.TestCase):
+    EPISODES = {
+        # Ongoing, all watched: one episode aired after the last watch date.
+        10: [tvmaze_episode(1, 1, "2024-01-01T01:00:00+00:00"), tvmaze_episode(1, 2, "2024-01-08T01:00:00+00:00"),
+             tvmaze_episode(2, 1, "2025-03-01T01:00:00+00:00"), tvmaze_episode(2, None, "2025-03-02T01:00:00+00:00"),
+             tvmaze_episode(3, 1, "2026-09-01T01:00:00+00:00")],
+        # In progress, next episode is S03E01: the answer is the S02 finale.
+        20: [tvmaze_episode(1, 1, "2019-01-01T01:00:00+00:00"), tvmaze_episode(2, 1, "2019-06-01T01:00:00+00:00"),
+             tvmaze_episode(2, 9, "2019-08-01T01:00:00+00:00"), tvmaze_episode(0, 1, "2019-09-01T01:00:00+00:00"),
+             tvmaze_episode(3, 1, "2020-06-01T01:00:00+00:00")],
+    }
+
+    @staticmethod
+    def show(tvdb_id, title, status, *, last_seen=None, next_episode=None, last_watched="2025-06-01T00:00:00Z"):
+        return {"tvdb_id": tvdb_id, "title": title, "status": status, "last_seen_episode": last_seen,
+                "next_episode": next_episode, "last_watched_at": last_watched}
+
+    def library(self):
+        return {"snapshot_at": "2026-06-28T07:11:59Z", "movies": [], "series": [
+            self.show(1, "Ongoing Done", "up_to_date", last_seen="S01E02"),
+            self.show(2, "Season Gap", "continuing", next_episode={"season": 3, "number": 1}),
+            self.show(3, "Unknown To TVmaze", "up_to_date"),
+            self.show(4, "Known Position", "continuing", last_seen="S01E05",
+                      next_episode={"season": 1, "number": 6}),
+            self.show(5, "Fresh", "not_started_yet", next_episode={"season": 1, "number": 1}),
+        ]}
+
+    def fetch(self, url):
+        self.urls.append(url)
+        if "thetvdb=" in url:
+            maze = {1: 10, 2: 20}.get(int(url.rsplit("=", 1)[1]))
+            return {"id": maze} if maze else None
+        return self.EPISODES[int(url.split("/shows/")[1].split("/")[0])]
+
+    def setUp(self):
+        self.urls = []
+
+    def test_positions_and_simkl_rows(self):
+        lib = self.library()
+        positions = tv.tvmaze_positions(lib, fetch=self.fetch, log=lambda *_: None)
+        self.assertEqual(positions, {1: "S02E01", 2: "S02E09"})
+        looked_up = {u.rsplit("=", 1)[1] for u in self.urls if "thetvdb=" in u}
+        self.assertEqual(looked_up, {"1", "2", "3"})
+        rows = {r[1]: r[6] for r in tv.simkl_rows(lib, positions)}
+        self.assertEqual(rows, {"Ongoing Done": "S02E01", "Season Gap": "S02E09", "Unknown To TVmaze": "",
+                                "Known Position": "S01E05", "Fresh": ""})
+
+    def test_completed_keeps_later_cached_episode(self):
+        lib = self.library()
+        lib["series"][0]["last_seen_episode"] = "S03E01"
+        self.assertEqual(tv.simkl_rows(lib, {1: "S02E01"})[0][6], "S03E01")
+
+    def test_unreachable_tvmaze_gives_up(self):
+        lines = []
+
+        def down(url):
+            self.urls.append(url)
+            raise OSError("offline")
+        self.assertEqual(tv.tvmaze_positions(self.library(), fetch=down, log=lines.append), {})
+        self.assertEqual(len(self.urls), 3)
+        self.assertIn("not reachable", lines[-1])
+
+    def test_offline_flag_skips_network(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = Path(tmp) / "DioCache.db"
+            make_dio_cache(cache, modern_cache_rows())
+            with mock.patch.object(tv, "tvmaze_positions") as lookup:
+                code, _, _ = run_cli(["--diocache", str(cache), "--output", str(Path(tmp) / "out"),
+                                      "--no-open", "--offline"])
+            self.assertEqual(code, 0)
+            lookup.assert_not_called()
 
 
 if __name__ == "__main__":

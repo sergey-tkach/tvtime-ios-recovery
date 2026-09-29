@@ -10,7 +10,7 @@ Finder / Apple Devices / iTunes backup, decrypts it, and gives you:
 - spreadsheets (`series.csv`, `episodes.csv`, `movies.csv`) and `library.json`,
 - a ready-to-import file for [Simkl](https://simkl.com) (`simkl_import.csv`).
 
-One Python file, no dependencies, works offline, never modifies the backup.
+One Python file, no dependencies, never modifies the backup.
 Русская версия: [README.ru.md](README.ru.md).
 
 ## Before you start
@@ -87,6 +87,7 @@ macOS blocks apps from reading `~/Library/Application Support/MobileSync`. Use o
 | `--diagnose` | Print the cache structure without personal data, for bug reports |
 | `--password-stdin` | Read the backup password from standard input |
 | `--no-open` | Don't open the page in the browser |
+| `--offline` | Don't look up episode numbers on TVmaze (the Simkl file is then less complete, see below) |
 
 ## What you get
 
@@ -123,23 +124,37 @@ invented data but haven't been checked against a real old backup yet.
 ## Moving to Simkl
 
 1. Sign in to Simkl and open [simkl.com/apps/import/csv](https://simkl.com/apps/import/csv/).
-2. Choose `simkl_import.csv`, keep *Use .csv data*, click *Upload and start import*.
+2. Start from an empty list. The import doesn't update series that are already in your Simkl lists, so
+   if you've imported before, click *Clean watchlist* on that page first.
+3. Choose `simkl_import.csv`, keep *Use .csv data*, click *Upload and start import*.
 
 | TV Time | Simkl |
 |---|---|
 | Watching | watching, with the last watched episode when it's known |
-| Up to date | completed |
+| Up to date | completed, up to the last episode aired before your last watch date |
 | Stopped | dropped |
 | Not started | plan to watch |
 | Watched movie | completed, with the watch date |
 
 Series are matched by TVDB ID (TV Time's show IDs are TheTVDB IDs), movies by IMDb ID. The file follows
-Simkl's documented CSV columns. For other services, start from `library.json` or the CSV files.
+Simkl's documented CSV columns (UTF-8 without BOM). For other services, start from `library.json` or the
+CSV files.
+
+Simkl only marks the episodes of a *completed* series without an episode number when the series has
+ended. An ongoing one would land in *watching* at 0%. So the tool looks up each *Up to date* series on
+[TVmaze](https://www.tvmaze.com/api) and writes the last episode aired before the date you last watched
+it. It does the same for *Watching* series whose next episode starts a new season: it writes the finale of
+the season before. With `--offline` those numbers are left out.
+
+After the import, ongoing series you're fully caught up on sit in *watching* with every aired episode
+marked. Simkl's *Watching* page hides them; they're in the *Full list*. All episodes of a series get the
+same watch date, the last one TV Time knew: that's a limit of the CSV format.
 
 ## Privacy
 
-- Everything runs on your computer and nothing is uploaded. The page loads poster images from
-  artworks.thetvdb.com when you open it.
+- Everything runs on your computer and nothing is uploaded. The one network request is to the public
+  TVmaze API: it receives the TVDB IDs of your series to find episode numbers for the Simkl file. Use
+  `--offline` to skip it. The page loads poster images from artworks.thetvdb.com when you open it.
 - The backup is opened read-only. The password is used only in memory.
 - `raw/` contains the app's cache, which includes your TV Time login tokens. The servers are gone, but
   don't share that folder. For bug reports, share only the `--diagnose` output: it lists field names and
